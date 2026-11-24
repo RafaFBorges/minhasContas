@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+#
+# minhasContas: ponto de entrada para subir, testar e construir os projetos juntos.
+#
+# Este repositório só guarda scripts e documentação. A API (minhasContas-DB) e o Web (minhasContas-Web) são clones
+# irmãos desta pasta, cada um com o seu git e o seu remoto: commit, push e histórico continuam dentro de cada projeto.
+# Rode `./dev help` para ver os comandos.
+#
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${WORK_DIR:-$(dirname "$ROOT")}"
+RUN_DIR="$ROOT/.run"
+
+# Onde estão os projetos (tudo pode ser trocado por variável de ambiente)
+API_REPO="${API_REPO:-git@github.com:RafaFBorges/minhasContas-DB.git}"
+WEB_REPO="${WEB_REPO:-git@github.com:RafaFBorges/minhasContas-Web.git}"
+API_DIR="${API_DIR:-$WORK_DIR/minhasContas-db}"
+WEB_DIR="${WEB_DIR:-$WORK_DIR/minhasContas-Web}"
+API_PORT="${API_PORT:-8080}"
+WEB_PORT="${WEB_PORT:-3000}"
+# Porta do Postgres definida no docker-compose da API (usada só nas verificações)
+DB_PORT="${DB_PORT:-5433}"
+
+if [[ -t 1 ]]; then
+  C_OK=$'\e[32m'; C_WARN=$'\e[33m'; C_ERR=$'\e[31m'; C_OFF=$'\e[0m'
+else
+  C_OK=''; C_WARN=''; C_ERR=''; C_OFF=''
+fi
+
+info() { printf '%s\n' "$*"; }
+ok() { printf '%s✔%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+err() { printf '%s✘%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------------------------------------------------
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null || true; }
+
+is_running() {
+  local pidf="$RUN_DIR/$1.pid"
+  [[ -f $pidf ]] && kill -0 "$(<"$pidf")" 2>/dev/null
+}
+
+require_dir() {
+  case "$1" in
+    api) [[ -d $API_DIR ]] || die "API não encontrada em $API_DIR. Rode ./dev setup" ;;
+    web) [[ -d $WEB_DIR ]] || die "Web não encontrado em $WEB_DIR. Rode ./dev setup" ;;
+  esac
+}
+
+# O banco é definido pelo docker-compose da API (única fonte da verdade). Aqui só se usa o serviço "db"
+compose_db() { docker compose -f "$API_DIR/docker-compose.yml" "$@"; }
+
+need_docker() { docker info >/dev/null 2>&1 || die "Docker não está acessível. Inicie o Docker e tente de novo"; }
+
+# Sobe um processo em segundo plano, em grupo próprio (para poder parar o mvn e o java filho juntos)
+start_bg() {
+  local name=$1 dir=$2
+  shift 2
+  mkdir -p "$RUN_DIR"
+  (cd "$dir"; setsid nohup "$@" >"$RUN_DIR/$name.log" 2>&1 </dev/null & echo $! >"$RUN_DIR/$name.pid")
+}
+
+stop_bg() {
+  local pidf="$RUN_DIR/$1.pid" pid i
+  [[ -f $pidf ]] || return 0
+  pid="$(<"$pidf")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 30); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$pidf"
+}
+
+wait_http() {
+  local name=$1 url=$2 limit=$3 i code
+  for ((i = 0; i < limit; i++)); do
+    if ! is_running "$name"; then
+      err "$name parou durante a subida. Últimas linhas do log:"
+      tail -n 25 "$RUN_DIR/$name.log" >&2 || true
+      return 1
+    fi
+    code="$(http_code "$url")"
+    if [[ $code != 000 ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  err "$name não respondeu em ${limit}s (veja ./dev logs $name)"
+  return 1
+}
+
+target_includes() { [[ $1 == all || $1 == "$2" ]]; }
+
+# ---------------------------------------------------------------------------------------------------------------------
+# setup / doctor
+# ---------------------------------------------------------------------------------------------------------------------
+
+clone_if_missing() {
+  local name=$1 url=$2 dir=$3
+  if [[ -e $dir/.git ]]; then
+    ok "$name: já existe em $dir"
+  else
+    info "$name: clonando $url"
+    git clone --recurse-submodules "$url" "$dir"
+    ok "$name: clonado em $dir"
+  fi
+}
+
+make_api_env() {
+  local target="$API_DIR/.env" template="$ROOT/env/api.env.example"
+  if [[ -f $target ]]; then
+    ok ".env da API: já existe (não alterado)"
+    return 0
+  fi
+  [[ -f $template ]] || die "modelo ausente: $template"
+  command -v openssl >/dev/null 2>&1 || die "openssl é necessário para gerar os segredos"
+
+  local content db_pass jwt admin_pass
+  content="$(<"$template")"
+  db_pass="$(openssl rand -hex 16)"
+  jwt="$(openssl rand -base64 48 | tr -d '\n')"
+  # A senha do Admin precisa passar na política da API: maiúscula, minúscula, número e caractere especial
+  admin_pass="Dv9$(openssl rand -hex 10)!"
+
+  content="${content//__DB_PASSWORD__/$db_pass}"
+  content="${content//__JWT_SECRET__/$jwt}"
+  content="${content//__ADMIN_PASSWORD__/$admin_pass}"
+  (umask 077; printf '%s\n' "$content" >"$target")
+  ok ".env da API criado em $target (segredos gerados; o login do Admin local está em ADMIN_USER e ADMIN_PASSWORD)"
+}
+
+install_web_deps() {
+  if [[ -d $WEB_DIR/node_modules ]]; then
+    ok "Web: dependências já instaladas"
+    return 0
+  fi
+  info "Web: instalando dependências"
+  if [[ -f $WEB_DIR/package-lock.json ]]; then
+    (cd "$WEB_DIR" && npm ci)
+  else
+    (cd "$WEB_DIR" && npm install)
+  fi
+}
+
+cmd_setup() {
+  clone_if_missing "api" "$API_REPO" "$API_DIR"
+  clone_if_missing "web" "$WEB_REPO" "$WEB_DIR"
+  # O Web usa o submódulo packages/componentes. Sem efeito se já estiver inicializado
+  git -C "$WEB_DIR" submodule update --init --recursive
+  make_api_env
+  install_web_deps
+  echo
+  cmd_doctor
+}
+
+cmd_doctor() {
+  local missing=0 v major key
+
+  need() {
+    if command -v "$1" >/dev/null 2>&1; then
+      ok "$1: $2"
+    else
+      err "$1 não encontrado ($3)"
+      missing=1
+    fi
+  }
+
+  need git "$(git --version 2>/dev/null)" "https://git-scm.com"
+  need curl "$(curl --version 2>/dev/null | head -n 1 | cut -d' ' -f1-2)" "usado para esperar os serviços subirem"
+  need openssl "$(openssl version 2>/dev/null)" "usado para gerar segredos no setup"
+
+  if command -v java >/dev/null 2>&1; then
+    v="$(java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
+    major="${v%%.*}"
+    if [[ $major =~ ^[0-9]+$ ]] && (( major >= 17 )); then ok "java: $v"; else err "java $v: a API precisa de 17 ou mais"; missing=1; fi
+  else
+    err "java não encontrado (a API precisa do JDK 17)"; missing=1
+  fi
+
+  need mvn "$(mvn -v 2>/dev/null | head -n 1 | sed 's/\x1b\[[0-9;]*m//g')" "Maven para a API"
+
+  if command -v node >/dev/null 2>&1; then
+    v="$(node -v)"
+    major="${v#v}"; major="${major%%.*}"
+    if [[ $major =~ ^[0-9]+$ ]] && (( major >= 18 )); then ok "node: $v"; else err "node $v: o Web precisa de 18 ou mais"; missing=1; fi
+  else
+    err "node não encontrado (o Web precisa do Node 18+)"; missing=1
+  fi
+  need npm "$(npm -v 2>/dev/null)" "vem com o Node"
+
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then ok "docker: $(docker --version)"; else err "docker instalado, mas o daemon não está acessível"; missing=1; fi
+    if docker compose version >/dev/null 2>&1; then ok "docker compose: $(docker compose version --short 2>/dev/null)"; else err "docker compose não encontrado"; missing=1; fi
+  else
+    err "docker não encontrado (banco local e testes de integração)"; missing=1
+  fi
+
+  echo
+  for name in api web; do
+    local dir
+    [[ $name == api ]] && dir="$API_DIR" || dir="$WEB_DIR"
+    if [[ -e $dir/.git ]]; then
+      ok "$name: $dir ($(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || echo 'detached'))"
+    else
+      err "$name: não encontrado em $dir (rode ./dev setup)"; missing=1
+    fi
+  done
+
+  if [[ -f $API_DIR/.env ]]; then
+    for key in POSTGRES_DB POSTGRES_PASSWORD DATASOURCE_URL DATASOURCE_USERNAME DATASOURCE_PASSWORD JWT_SECRET; do
+      if grep -qE "^${key}=.+" "$API_DIR/.env"; then :; else err ".env da API sem $key"; missing=1; fi
+    done
+    ok ".env da API: variáveis obrigatórias presentes"
+  else
+    err ".env da API ausente (rode ./dev setup)"; missing=1
+  fi
+  if [[ -d $WEB_DIR && ! -d $WEB_DIR/node_modules ]]; then err "Web sem node_modules (rode ./dev setup)"; missing=1; fi
+
+  echo
+  for p in "$WEB_PORT:web" "$API_PORT:api" "$DB_PORT:banco"; do
+    if port_open "${p%%:*}"; then info "  porta ${p%%:*} (${p##*:}): em uso"; else info "  porta ${p%%:*} (${p##*:}): livre"; fi
+  done
+
+  if (( missing )); then
+    echo
+    die "ambiente incompleto: corrija os itens acima"
+  fi
+  echo
+  ok "ambiente pronto"
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# up / down / status / logs / reset-db
+# ---------------------------------------------------------------------------------------------------------------------
+
+up_db() {
+  need_docker
+  require_dir api
+  [[ -f $API_DIR/.env ]] || die "API sem .env. Rode ./dev setup"
+  info "db: subindo (docker compose da API)"
+  compose_db up -d --wait db
+  ok "db: pronto na porta $DB_PORT"
+}
+
+up_api() {
+  require_dir api
+  if is_running api; then
+    ok "api: já está rodando (pid $(<"$RUN_DIR/api.pid"))"
+    return 0
+  fi
+  [[ -f $API_DIR/.env ]] || die "API sem .env. Rode ./dev setup"
+  port_open "$API_PORT" && die "porta $API_PORT já está em uso por outro processo (não foi iniciado por este script)"
+  port_open "$DB_PORT" || die "banco fora do ar na porta $DB_PORT. Rode ./dev up db"
+  info "api: subindo (mvn spring-boot:run)"
+  start_bg api "$API_DIR" mvn -B -ntp spring-boot:run
+  wait_http api "http://localhost:$API_PORT/" 240
+  ok "api: http://localhost:$API_PORT"
+}
+
+up_web() {
+  require_dir web
+  if is_running web; then
+    ok "web: já está rodando (pid $(<"$RUN_DIR/web.pid"))"
+    return 0
+  fi
+  [[ -d $WEB_DIR/node_modules ]] || die "Web sem dependências. Rode ./dev setup"
+  port_open "$WEB_PORT" && die "porta $WEB_PORT já está em uso por outro processo (não foi iniciado por este script)"
+  info "web: subindo (npm run dev)"
+  start_bg web "$WEB_DIR" env "API_URL=http://localhost:$API_PORT/" npm run dev -- -p "$WEB_PORT"
+  wait_http web "http://localhost:$WEB_PORT/" 90
+  ok "web: http://localhost:$WEB_PORT"
+}
+
+cmd_up() {
+  local want_db=0 want_api=0 want_web=0 t
+  if (( $# == 0 )); then want_db=1; want_api=1; want_web=1; fi
+  for t in "$@"; do
+    case "$t" in
+      db) want_db=1 ;;
+      api) want_api=1 ;;
+      web) want_web=1 ;;
+      *) die "serviço inválido: $t (use db, api ou web)" ;;
+    esac
+  done
+  if (( want_db )); then up_db; fi
+  if (( want_api )); then up_api; fi
+  if (( want_web )); then up_web; fi
+}
+
+cmd_down() {
+  local keep_db=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --keep-db) keep_db=1 ;;
+      *) die "opção inválida: $arg (use --keep-db para manter o banco no ar)" ;;
+    esac
+  done
+  if is_running web; then info "web: parando"; fi
+  stop_bg web
+  if is_running api; then info "api: parando"; fi
+  stop_bg api
+  if (( keep_db )); then
+    info "db: mantido no ar"
+  elif [[ -f $API_DIR/docker-compose.yml ]] && docker info >/dev/null 2>&1; then
+    info "db: parando (os dados ficam no volume)"
+    compose_db stop db >/dev/null
+  fi
+  ok "tudo parado"
+}
+
+svc_status() {
+  local name=$1 port=$2 url=$3
+  if is_running "$name"; then
+    printf '%-5s rodando (pid %s) %s HTTP %s\n' "$name" "$(<"$RUN_DIR/$name.pid")" "$url" "$(http_code "$url")"
+  elif port_open "$port"; then
+    printf '%-5s porta %s em uso por outro processo (não foi iniciado por este script)\n' "$name" "$port"
+  else
+    printf '%-5s parado\n' "$name"
+  fi
+}
+
+cmd_status() {
+  local cid health=""
+  if [[ -f $API_DIR/docker-compose.yml && -f $API_DIR/.env ]] && docker info >/dev/null 2>&1; then
+    cid="$(compose_db ps -q db 2>/dev/null || true)"
+    if [[ -n $cid ]]; then
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -n $health ]]; then printf '%-5s %s (porta %s)\n' db "$health" "$DB_PORT"; else printf '%-5s parado\n' db; fi
+  svc_status api "$API_PORT" "http://localhost:$API_PORT/"
+  svc_status web "$WEB_PORT" "http://localhost:$WEB_PORT/"
+}
+
+cmd_logs() {
+  local svc="${1:-}"
+  case "$svc" in
+    api | web)
+      [[ -f $RUN_DIR/$svc.log ]] || die "sem log de $svc (ele foi iniciado por ./dev up?)"
+      tail -n 100 -f "$RUN_DIR/$svc.log"
+      ;;
+    db)
+      need_docker
+      compose_db logs -f --tail 100 db
+      ;;
+    *) die "uso: ./dev logs api|web|db" ;;
+  esac
+}
+
+cmd_reset_db() {
+  local answer
+  warn "Isto APAGA todos os dados do banco local (o volume do docker-compose da API)."
+  [[ -t 0 ]] || die "confirmação interativa necessária"
+  read -r -p "Digite 'apagar' para confirmar: " answer
+  [[ $answer == apagar ]] || die "cancelado"
+  need_docker
+  stop_bg web
+  stop_bg api
+  compose_db down -v
+  up_db
+  ok "banco recriado vazio. Suba a API para o Flyway criar o esquema: ./dev up api"
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# test / lint / build
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Separa as classes de teste da API em unitárias (sem Spring) e de integração (Spring e/ou Testcontainers)
+api_test_classes() {
+  local kind=$1 flag pattern='@SpringBootTest|@Testcontainers|@DataJpaTest|@WebMvcTest' file names=()
+  if [[ $kind == integration ]]; then flag=-rlE; else flag=-rLE; fi
+  while IFS= read -r file; do
+    [[ -n $file ]] && names+=("$(basename "$file" .java)")
+  done < <(grep "$flag" "$pattern" --include='*Test.java' --include='*Tests.java' "$API_DIR/src/test" 2>/dev/null | sort || true)
+  local IFS=,
+  printf '%s' "${names[*]:-}"
+}
+
+sum_xml() {
+  find "$1" -name 'TEST-*.xml' -print0 2>/dev/null | xargs -0 -r grep -ho " $2=\"[0-9]*\"" | tr -dc '0-9\n' | awk '{s += $1} END {print s + 0}'
+}
+
+run_api_tests() {
+  local kind=$1 classes rc=0 total fails errs reports="$API_DIR/target/surefire-reports"
+  require_dir api
+  classes="$(api_test_classes "$kind")"
+  if [[ -z $classes ]]; then warn "api $kind: nenhuma classe de teste encontrada"; return 0; fi
+  if [[ $kind == integration ]]; then need_docker; fi
+  info "▶ api $kind ($(tr ',' '\n' <<<"$classes" | wc -l | tr -d ' ') classes)"
+  # Relatórios velhos enganam: o Maven deste projeto pode "passar" sem executar nada se houver erro de compilação
+  rm -rf "$reports"
+  (cd "$API_DIR" && mvn -B -ntp test -Dtest="$classes" -Dsurefire.failIfNoSpecifiedTests=false) || rc=$?
+  total="$(sum_xml "$reports" tests)"
+  fails="$(sum_xml "$reports" failures)"
+  errs="$(sum_xml "$reports" errors)"
+  if (( total == 0 )); then err "api $kind: nenhum teste foi executado (erro de compilação?)"; return 1; fi
+  if (( rc != 0 || fails > 0 || errs > 0 )); then err "api $kind: $total testes, $fails falhas, $errs erros"; return 1; fi
+  ok "api $kind: $total testes, 0 falhas"
+}
+
+run_web_static() {
+  require_dir web
+  [[ -d $WEB_DIR/node_modules ]] || die "Web sem dependências. Rode ./dev setup"
+  info "▶ web static (lint e typecheck)"
+  if (cd "$WEB_DIR" && npm run lint --silent && npx --no-install tsc --noEmit); then
+    ok "web static: lint e tsc sem erros"
+  else
+    err "web static: falhou"
+    return 1
+  fi
+}
+
+# tipos: unit | integration | static | e2e | all   alvos: api | web | all
+cmd_test() {
+  local kind="${1:-all}" target="${2:-all}" rc=0 ran=0
+  case "$kind" in unit | integration | static | e2e | all) ;; *) die "tipo inválido: $kind (unit, integration, static, e2e ou all)" ;; esac
+  case "$target" in api | web | all) ;; *) die "alvo inválido: $target (api, web ou all)" ;; esac
+
+  if [[ $kind == e2e ]]; then
+    err "e2e ainda não existe (backlog: testes E2E com Playwright)"
+    return 2
+  fi
+  if target_includes "$target" api && [[ $kind == unit || $kind == all ]]; then run_api_tests unit || rc=1; ran=1; fi
+  if target_includes "$target" api && [[ $kind == integration || $kind == all ]]; then run_api_tests integration || rc=1; ran=1; fi
+  if target_includes "$target" web && [[ $kind == static || $kind == all ]]; then run_web_static || rc=1; ran=1; fi
+  if [[ $kind == all ]]; then warn "e2e: ainda não implementado (fica de fora do 'all')"; fi
+  if (( ! ran )); then warn "nada a rodar para '$kind' em '$target' (hoje: api tem unit e integration; web tem static)"; fi
+  return "$rc"
+}
+
+cmd_lint() { run_web_static; }
+
+cmd_build() {
+  local target="${1:-all}"
+  case "$target" in api | web | all) ;; *) die "alvo inválido: $target (api, web ou all)" ;; esac
+  if target_includes "$target" api; then
+    require_dir api
+    info "▶ api: mvn package (sem testes)"
+    (cd "$API_DIR" && mvn -B -ntp -DskipTests package)
+    ok "api: build ok"
+  fi
+  if target_includes "$target" web; then
+    require_dir web
+    if is_running web; then die "pare o Web (./dev down) antes do build: ele e o dev server usam a mesma pasta .next"; fi
+    info "▶ web: next build"
+    (cd "$WEB_DIR" && API_URL="http://localhost:$API_PORT/" ALLOW_INSECURE_API_URL=1 npm run build)
+    ok "web: build ok"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# git (visão dos três repositórios)
+# ---------------------------------------------------------------------------------------------------------------------
+
+repo_line() {
+  local name=$1 dir=$2 branch dirty counts behind ahead last sync
+  if [[ ! -e $dir/.git ]]; then printf '%-5s não clonado (%s)\n' "$name" "$dir"; return 0; fi
+  # symbolic-ref funciona também num repositório novo, ainda sem commits
+  branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '(detached)')"
+  dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+  counts="$(git -C "$dir" rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null || true)"
+  if [[ -n $counts ]]; then
+    read -r behind ahead <<<"$counts"
+    sync="↓$behind ↑$ahead"
+  else
+    sync="sem upstream"
+  fi
+  last="$(git -C "$dir" log -1 --format='%h %s' 2>/dev/null || true)"
+  printf '%-5s %-14s %-12s %-3s alterações  %s\n' "$name" "$branch" "$sync" "$dirty" "$last"
+}
+
+cmd_git() {
+  local sub="${1:-status}"
+  case "$sub" in
+    status)
+      repo_line dev "$ROOT"
+      repo_line api "$API_DIR"
+      repo_line web "$WEB_DIR"
+      ;;
+    pull)
+      local name dir
+      for name in dev api web; do
+        case "$name" in dev) dir="$ROOT" ;; api) dir="$API_DIR" ;; web) dir="$WEB_DIR" ;; esac
+        [[ -e $dir/.git ]] || { warn "$name: não clonado"; continue; }
+        info "$name: git pull --ff-only"
+        git -C "$dir" pull --ff-only || warn "$name: pull não foi possível (alterações locais ou branch divergente)"
+      done
+      git -C "$WEB_DIR" submodule update --init --recursive
+      ;;
+    *) die "uso: ./dev git [status|pull]" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<EOF
+minhasContas: sobe, testa e constrói a API e o Web juntos.
+
+Uso: ./dev <comando> [argumentos]
+
+Ambiente
+  setup                   clona o que faltar, cria o .env da API (com segredos gerados) e instala as dependências do Web
+  doctor                  confere ferramentas, projetos, .env e portas
+
+Executar
+  up [db] [api] [web]     sobe os serviços (sem argumento: todos, nessa ordem). Banco no Docker; API e Web locais
+  down [--keep-db]        para tudo (o banco para junto, salvo com --keep-db; os dados ficam no volume)
+  status                  mostra o estado de db, api e web
+  logs api|web|db         acompanha o log de um serviço
+  reset-db                apaga os dados do banco local (pede confirmação)
+
+Testes
+  test [tipo] [alvo]      tipo: unit | integration | static | e2e | all (padrão: all)
+                          alvo: api | web | all (padrão: all)
+                            unit         api: classes sem Spring (rápidas, sem Docker)
+                            integration  api: Spring + Testcontainers (precisam de Docker)
+                            static       web: lint + typecheck
+                            e2e          ainda não existe (backlog)
+  lint                    atalho para: test static web
+  build [api|web|all]     gera o build de cada projeto
+
+Git
+  git [status]            branch, alterações e ahead/behind de dev, api e web
+  git pull                git pull --ff-only nos três e atualiza o submódulo do Web
+
+Locais (trocáveis por variável de ambiente)
+  API_DIR=$API_DIR
+  WEB_DIR=$WEB_DIR
+  API_PORT=$API_PORT  WEB_PORT=$WEB_PORT
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    reset-db) cmd_reset_db "$@" ;;
+    test) cmd_test "$@" ;;
+    lint) cmd_lint "$@" ;;
+    build) cmd_build "$@" ;;
+    git) cmd_git "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *) err "comando desconhecido: $cmd"; echo >&2; cmd_help >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
