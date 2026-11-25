@@ -143,16 +143,19 @@ make_api_env() {
 }
 
 install_web_deps() {
-  if [[ -d $WEB_DIR/node_modules ]]; then
+  # O npm só grava node_modules/.package-lock.json ao terminar; a pasta sozinha pode ser de um install interrompido
+  if [[ -f $WEB_DIR/node_modules/.package-lock.json ]]; then
     ok "Web: dependências já instaladas"
     return 0
   fi
   info "Web: instalando dependências"
-  if [[ -f $WEB_DIR/package-lock.json ]]; then
-    (cd "$WEB_DIR" && npm ci)
-  else
-    (cd "$WEB_DIR" && npm install)
+  # `npm ci` é o ideal, mas o package-lock.json do Web não cobre o pacote local (packages/componentes)
+  # e o `ci` recusa lock fora de sincronia. O CI do Web usa `npm install`, então caímos nele.
+  if [[ -f $WEB_DIR/package-lock.json ]] && (cd "$WEB_DIR" && npm ci); then
+    return 0
   fi
+  warn "Web: 'npm ci' não serviu (lock fora de sincronia); usando 'npm install' (pode alterar o package-lock.json do Web: não commite essa mudança sem querer)"
+  (cd "$WEB_DIR" && npm install)
 }
 
 cmd_setup() {
@@ -402,10 +405,22 @@ run_api_tests() {
   info "▶ api $kind ($(tr ',' '\n' <<<"$classes" | wc -l | tr -d ' ') classes)"
   # Relatórios velhos enganam: o Maven deste projeto pode "passar" sem executar nada se houver erro de compilação
   rm -rf "$reports"
-  (cd "$API_DIR" && mvn -B -ntp test -Dtest="$classes" -Dsurefire.failIfNoSpecifiedTests=false) || rc=$?
-  total="$(sum_xml "$reports" tests)"
-  fails="$(sum_xml "$reports" failures)"
-  errs="$(sum_xml "$reports" errors)"
+  local log; log="$(mktemp)"
+  set +e
+  (cd "$API_DIR" && mvn -B -ntp test -Dtest="$classes" -Dsurefire.failIfNoSpecifiedTests=false) 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  # Total vem do resumo do próprio Maven (última linha "Tests run:" sem "-- in <classe>"): o XML do surefire
+  # perde testes de classes @Nested (ExpensesTests: 16 rodam, o XML registra 11). O XML fica só como reserva.
+  local summary; summary="$(grep -E 'Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+' "$log" | grep -v ' -- in ' | tail -1 || true)"
+  rm -f "$log"
+  if [[ -n $summary ]]; then
+    total="$(sed -E 's/.*Tests run: ([0-9]+),.*/\1/' <<<"$summary")"
+    fails="$(sed -E 's/.*Failures: ([0-9]+),.*/\1/' <<<"$summary")"
+    errs="$(sed -E 's/.*Errors: ([0-9]+),.*/\1/' <<<"$summary")"
+  else
+    total="$(sum_xml "$reports" tests)"; fails="$(sum_xml "$reports" failures)"; errs="$(sum_xml "$reports" errors)"
+  fi
   if (( total == 0 )); then err "api $kind: nenhum teste foi executado (erro de compilação?)"; return 1; fi
   if (( rc != 0 || fails > 0 || errs > 0 )); then err "api $kind: $total testes, $fails falhas, $errs erros"; return 1; fi
   ok "api $kind: $total testes, 0 falhas"
