@@ -1,0 +1,35 @@
+{
+  // Aparecem no painel "Run and Debug" (Ctrl+Shift+D), no seletor ao lado do botão de play.
+  // Cada uma só roda o comando ./dev correspondente num terminal (as demais ficam em tasks.json).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "minhasContas: subir tudo",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev up",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "minhasContas: parar tudo",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev down",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "minhasContas: status",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev status",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "minhasContas: testes (tudo)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev test",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

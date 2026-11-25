@@ -44,6 +44,10 @@ O que o `setup` **não** faz: trocar de branch. Os clones vêm na `main`; se voc
 | `./dev build [api\|web\|all]` | build de cada projeto |
 | `./dev git [status\|pull]` | branch, alterações e ahead/behind dos três repositórios |
 
+Para ver os três projetos juntos no VS Code, abra o workspace: `File > Open Workspace from File...` e escolha `minhasContas.code-workspace` (os projetos aparecem no Explorer e cada um tem seu próprio repositório no Source Control).
+
+No VS Code (abrindo esta pasta): `Ctrl+Shift+B` sobe tudo, `Terminal > Run Task` lista todas as ações (subir, parar, logs, testes por tipo, build) e o painel Run and Debug tem atalhos para subir, parar, status e testes. Ficam em `.vscode/`.
+
 Endereços locais: Web em http://localhost:3000, API em http://localhost:8080, Postgres na porta 5433.
 
 ### Como sobe

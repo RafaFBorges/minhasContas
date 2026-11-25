@@ -1,0 +1,11 @@
+{
+  // Abre os três projetos juntos no VS Code (File > Open Workspace from File...).
+  // Os caminhos são relativos: funcionam com as pastas lado a lado (veja o README).
+  // Cada pasta continua sendo um repositório git independente no Source Control.
+  "folders": [
+    { "name": "scripts (minhasContas)", "path": "." },
+    { "name": "API (minhasContas-db)", "path": "../minhasContas-db" },
+    { "name": "Web (minhasContas-Web)", "path": "../minhasContas-Web" }
+  ],
+  "settings": {}
+}

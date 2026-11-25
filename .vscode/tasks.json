@@ -1,0 +1,100 @@
+{
+  // Tarefas do minhasContas. Abrir com: Ctrl+Shift+P > "Tasks: Run Task".
+  // Ctrl+Shift+B roda a tarefa padrão ("Subir tudo").
+  "version": "2.0.0",
+  "options": { "cwd": "${workspaceFolder}" },
+  "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+  "tasks": [
+    {
+      "label": "Subir tudo (db + api + web)",
+      "type": "shell",
+      "command": "./dev up",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Subir só o Web",
+      "type": "shell",
+      "command": "./dev up web",
+      "problemMatcher": []
+    },
+    {
+      "label": "Parar tudo",
+      "type": "shell",
+      "command": "./dev down",
+      "problemMatcher": []
+    },
+    {
+      "label": "Parar tudo (manter o banco)",
+      "type": "shell",
+      "command": "./dev down --keep-db",
+      "problemMatcher": []
+    },
+    {
+      "label": "Status",
+      "type": "shell",
+      "command": "./dev status",
+      "problemMatcher": []
+    },
+    {
+      "label": "Doctor (conferir ambiente)",
+      "type": "shell",
+      "command": "./dev doctor",
+      "problemMatcher": []
+    },
+    {
+      "label": "Logs da API",
+      "type": "shell",
+      "command": "./dev logs api",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Logs do Web",
+      "type": "shell",
+      "command": "./dev logs web",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Testes: tudo (unit + integration + static)",
+      "type": "shell",
+      "command": "./dev test",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Testes: unit (API)",
+      "type": "shell",
+      "command": "./dev test unit api",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Testes: integration (API, precisa de Docker)",
+      "type": "shell",
+      "command": "./dev test integration api",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Testes: static (Web, lint + tsc)",
+      "type": "shell",
+      "command": "./dev test static web",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build: tudo",
+      "type": "shell",
+      "command": "./dev build all",
+      "problemMatcher": []
+    },
+    {
+      "label": "Git: status dos 3 repositórios",
+      "type": "shell",
+      "command": "./dev git status",
+      "problemMatcher": []
+    }
+  ]
+}
